@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from unittest import mock
 
 from app import create_app, services
 
@@ -312,12 +313,41 @@ class TransferTests(BaseTest):
         self.assertEqual((self.balance(self.a), self.balance(self.b)), (70, 80))
 
     def test_credit_leg_failure_rolls_back_debit(self):
-        # Pre-existing tx on B with the derived credit-leg reference makes the credit leg violate UNIQUE.
-        self.tx(self.b, "credit", 1, "clash:credit")
-        r = self.transfer(self.a, self.b, 30, ref="clash")
-        self.assertEqual(r.status_code, 409)
-        self.assertEqual(self.balance(self.a), 100)  # debit leg rolled back
-        self.assertEqual(self.balance(self.b), 51)
+        # Force the second (credit) leg to blow up after the debit leg has already been applied.
+        real_apply = services._apply
+
+        def failing_credit(conn, account_id, tx_type, *args):
+            if tx_type == "credit":
+                raise RuntimeError("simulated failure")
+            return real_apply(conn, account_id, tx_type, *args)
+
+        with mock.patch.object(services, "_apply", failing_credit):
+            r = self.transfer(self.a, self.b, 30, ref="boom")
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual((self.balance(self.a), self.balance(self.b)), (100, 50))  # debit leg rolled back
+        self.assertEqual(self.c.get(f"/accounts/{self.a}/transactions").get_json()["pagination"]["total_records"], 1)
+        self.assertEqual(self.c.get(f"/accounts/{self.a}/reconcile").get_json()["consistent"], True)
+
+    def test_leg_like_reference_does_not_break_transfer(self):
+        # A plain transaction that looks like an old-style derived leg reference must not interfere.
+        self.tx(self.a, "credit", 1, "t1:debit")
+        self.tx(self.b, "credit", 1, "t1:credit")
+        r = self.transfer(self.a, self.b, 30, ref="t1")
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual((self.balance(self.a), self.balance(self.b)), (71, 81))
+
+    def test_same_reference_from_different_sources_to_same_destination(self):
+        c = self.account("C")["id"]
+        self.tx(c, "credit", 100, "seed")
+        self.assertEqual(self.transfer(self.a, self.b, 10, ref="shared").status_code, 201)
+        self.assertEqual(self.transfer(c, self.b, 10, ref="shared").status_code, 201)
+        self.assertEqual((self.balance(self.a), self.balance(c), self.balance(self.b)), (90, 90, 70))
+
+    def test_client_cannot_use_reserved_reference_prefix(self):
+        r = self.tx(self.a, "credit", 1, "xfer:anything")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json()["error"]["details"][0]["field"], "reference_id")
+        self.assertEqual(self.balance(self.a), 100)
 
     def test_transfer_reference_does_not_collide_with_plain_transaction(self):
         self.tx(self.b, "credit", 1, "shared")
@@ -326,11 +356,13 @@ class TransferTests(BaseTest):
         self.assertEqual(r.status_code, 201)
         self.assertEqual((self.balance(self.a), self.balance(self.b)), (71, 81))
 
-    def test_transfer_reference_reused_with_different_payload(self):
+    def test_transfer_reference_reused_with_different_payload_is_still_a_duplicate(self):
         self.assertEqual(self.transfer(self.a, self.b, 30).status_code, 201)
         r = self.transfer(self.a, self.b, 31)
-        self.assertEqual(r.status_code, 422)
-        self.assertEqual(r.get_json()["error"]["code"], "IDEMPOTENCY_MISMATCH")
+        self.assertEqual(r.status_code, 409)
+        err = r.get_json()["error"]
+        self.assertEqual(err["code"], "DUPLICATE_TRANSACTION")
+        self.assertFalse(err["payload_matches"])
         self.assertEqual((self.balance(self.a), self.balance(self.b)), (70, 80))
 
     def test_transfer_idempotency_header(self):
@@ -388,23 +420,26 @@ class HardeningTests(BaseTest):
         r = self.c.post("/transactions", json={"account_id": str(uuid.uuid4()), "type": "credit", "amount": 1, "reference_id": "f3"})
         self.assertEqual(r.status_code, 404)
 
-    def test_same_reference_different_payload_is_a_mismatch(self):
+    def test_same_reference_different_payload_is_still_a_duplicate(self):
         a = self.account()["id"]
         self.tx(a, "credit", 100, "ref")
         r = self.tx(a, "credit", 999, "ref")
-        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.status_code, 409)
         err = r.get_json()["error"]
-        self.assertEqual(err["code"], "IDEMPOTENCY_MISMATCH")
+        self.assertEqual(err["code"], "DUPLICATE_TRANSACTION")
+        self.assertFalse(err["payload_matches"])
         self.assertEqual(err["existing_transaction"]["amount"], 100)
         r = self.tx(a, "debit", 100, "ref")
-        self.assertEqual(r.get_json()["error"]["code"], "IDEMPOTENCY_MISMATCH")
+        self.assertEqual((r.status_code, r.get_json()["error"]["code"]), (409, "DUPLICATE_TRANSACTION"))
         self.assertEqual(self.balance(a), 100)
+        self.assertEqual(self.c.get(f"/accounts/{a}/transactions").get_json()["pagination"]["total_records"], 1)
 
     def test_same_reference_same_payload_is_a_plain_duplicate(self):
         a = self.account()["id"]
         self.tx(a, "credit", 100, "ref", description="x")
         r = self.tx(a, "credit", 100, "ref", description="x")
         self.assertEqual((r.status_code, r.get_json()["error"]["code"]), (409, "DUPLICATE_TRANSACTION"))
+        self.assertTrue(r.get_json()["error"]["payload_matches"])
 
     def test_idempotency_key_header(self):
         a = self.account()["id"]

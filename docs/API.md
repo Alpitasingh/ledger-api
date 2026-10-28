@@ -23,9 +23,8 @@ Every error uses the same shape:
 | 404 | `ACCOUNT_NOT_FOUND` | Account id is well-formed but does not exist |
 | 404 | `NOT_FOUND` | Unknown route |
 | 405 | `METHOD_NOT_ALLOWED` | e.g. PUT/PATCH/DELETE on transactions |
-| 409 | `DUPLICATE_TRANSACTION` | Same `reference_id` **and same payload** already recorded for that account (a safe retry; includes the existing record) |
+| 409 | `DUPLICATE_TRANSACTION` | `reference_id` already recorded for that account (or, for transfers, that source account). Nothing is created or changed. Body includes the existing record and `payload_matches` (`true` = faithful retry, `false` = same reference sent with a different payload) |
 | 413 | `PAYLOAD_TOO_LARGE` | Request body larger than 64 KB |
-| 422 | `IDEMPOTENCY_MISMATCH` | `reference_id` already used for a **different** payload (type/amount/description, or transfer target/amount); includes the existing record |
 | 422 | `INSUFFICIENT_BALANCE` | Debit/transfer larger than available balance |
 | 500 | `INTERNAL_ERROR` | Unexpected failure (nothing is persisted) |
 
@@ -84,9 +83,10 @@ Returns the same object as above. `404` if it does not exist, `400` if the id is
 }
 ```
 
-Other outcomes: `409 DUPLICATE_TRANSACTION` (same reference and payload: no new row, balance unchanged,
-body contains `existing_transaction`), `422 IDEMPOTENCY_MISMATCH` (same reference, different payload:
-nothing changes), `422 INSUFFICIENT_BALANCE` (balance unchanged), `404`, `400`.
+Other outcomes: `409 DUPLICATE_TRANSACTION` (same reference on the same account, whatever the payload: no new
+row, balance unchanged; body contains `existing_transaction` and `payload_matches`),
+`422 INSUFFICIENT_BALANCE` (balance unchanged), `404`, `400`.
+`reference_id` values starting with `xfer:` are reserved for transfers and rejected with `400`.
 
 ## 5. Transaction history — `GET /accounts/{account_id}/transactions`
 
@@ -114,9 +114,10 @@ A page beyond the last returns `data: []` with the correct totals.
  "reference_id": "xfer-1", "description": "Rent"}
 ```
 `reference_id` is required (or send `Idempotency-Key`) and is unique per source account (safe retries).
-The two ledger entries get the derived references `<reference_id>:debit` (source) and
-`<reference_id>:credit` (destination), so a transfer never collides with an ordinary transaction that
-uses the same reference.
+The two ledger entries get the references `xfer:<transfer_id>:debit` (source) and
+`xfer:<transfer_id>:credit` (destination). They are built from the transfer's own unique id under a reserved
+prefix, so a transfer never collides with an ordinary transaction or another transfer, whatever
+`reference_id` was sent.
 
 `201 Created`
 ```json
@@ -126,7 +127,7 @@ uses the same reference.
   "balances": {"<from_id>": 70, "<to_id>": 80}
 }
 ```
-Errors: `404` (either account missing), `422` (insufficient balance), `409` (duplicate reference, same payload), `422 IDEMPOTENCY_MISMATCH` (reference reused with a different payload),
+Errors: `404` (either account missing), `422` (insufficient balance), `409` (duplicate reference for the source account, with `payload_matches` in the body),
 `400` (validation, including same source and destination). On any failure neither account changes.
 
 ## 7. Reconcile — `GET /accounts/{account_id}/reconcile`

@@ -44,10 +44,3 @@ class InsufficientBalance(ApiError):
 class DuplicateTransaction(ApiError):
     status = 409
     code = "DUPLICATE_TRANSACTION"
-
-
-class IdempotencyMismatch(ApiError):
-    """Same reference_id re-used with a different payload: a client bug, not a safe retry."""
-
-    status = 422
-    code = "IDEMPOTENCY_MISMATCH"

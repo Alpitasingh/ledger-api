@@ -8,8 +8,9 @@
 4. **Duplicate `reference_id`** returns **409 Conflict** (`DUPLICATE_TRANSACTION`) with the original
    transaction in the body and changes nothing. A 409 rather than a 200 is used so a client can tell
    "already existed" from "just created"; the body still carries the original record, so retries are safe.
-   If the retry's payload (type, amount, description) **differs** from the original, the API returns
-   **422 `IDEMPOTENCY_MISMATCH`** instead, because that is a client bug rather than a retry.
+   The same 409 is returned even if the retry's payload (type, amount, description) differs from the
+   original; the body's `payload_matches` flag (`true`/`false`) lets a client tell a faithful retry from a
+   reused reference. Nothing is created or changed in either case.
    A *rejected* (e.g. insufficient-balance) transaction is not stored, so its `reference_id` can be
    reused for a retry. The trade-off is that failed attempts leave no audit row; a production system might
    log them separately.
@@ -23,9 +24,10 @@
    a page within range but past the end returns an empty list.
    Ordering is `created_at DESC` with insertion order as the tie-breaker.
 9. **Transfers** require a `reference_id`, cannot have the same source and destination, and create one
-   debit and one credit ledger entry whose references are derived (`<ref>:debit`, `<ref>:credit`) so they
-   cannot collide with ordinary transactions. A transfer `reference_id` is unique per source account, and
-   re-using it with a different payload returns 422 `IDEMPOTENCY_MISMATCH`.
+   debit and one credit ledger entry. The ledger entries' own references are `xfer:<transfer_id>:debit` /
+   `xfer:<transfer_id>:credit`; the `xfer:` prefix is reserved and rejected (400) on ordinary transactions,
+   so legs can never collide with anything a client sends. A transfer `reference_id` is unique per source
+   account; re-using it (with any payload) returns 409 `DUPLICATE_TRANSACTION` with `payload_matches`.
 10. **No authentication/authorization**; out of scope for this assignment.
 11. **SQLite** is used for easy local setup. It serializes writers (`BEGIN IMMEDIATE`), which makes
     concurrency correctness simple. On PostgreSQL/MySQL the same design would use `SELECT ... FOR UPDATE`

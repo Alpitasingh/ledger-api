@@ -44,9 +44,9 @@ docker run -p 5000:5000 -v ledger-data:/data ledger-api   # runs as a non-root u
 python -m unittest discover -s tests -t . -v
 ```
 
-55 tests cover validation, the rules in the brief, pagination/filtering/sorting,
+58 tests cover validation, the rules in the brief, pagination/filtering/sorting,
 immutability, atomic rollback, concurrent debits and concurrent duplicate references,
-idempotency (including payload mismatch), transfers, reconciliation and input hardening.
+idempotency (including same reference with a different payload), transfers, reconciliation and input hardening.
 
 Lint (optional): `pip install -r requirements-dev.txt && ruff check .`. CI (`.github/workflows/ci.yml`)
 runs both on every push.
@@ -81,8 +81,8 @@ run.py  Dockerfile  docker-compose.yml  pyproject.toml (ruff)  .github/workflows
 | Immutability | No update/delete endpoints (405), and DB triggers abort any `UPDATE`/`DELETE` on `transactions` |
 | Balance consistency | Balance only changes inside the same DB transaction that inserts the ledger row; a test asserts `balance == SUM(credits) - SUM(debits)` |
 | Money precision | Stored as integer minor units (amount x 100), max 2 decimal places, no floats in storage |
-| Transfers | Both legs, both balance updates and the `transfers` record commit together or not at all; leg references are derived (`<ref>:debit` / `<ref>:credit`) so they cannot collide with normal transactions |
-| Idempotency | Same `reference_id` + same payload: 409 with the original record. Same `reference_id` + different payload: 422 `IDEMPOTENCY_MISMATCH`. `Idempotency-Key` header accepted as an alternative |
+| Transfers | Both legs, both balance updates and the `transfers` record commit together or not at all; leg references are `xfer:<transfer_id>:debit/credit` (reserved prefix) so they cannot collide with normal transactions or other transfers |
+| Idempotency | Same `reference_id` on the same account: 409 `DUPLICATE_TRANSACTION` with the original record and a `payload_matches` flag; nothing is created. `Idempotency-Key` header accepted as an alternative |
 | Auditable consistency | `GET /accounts/{id}/reconcile` recomputes the balance from the ledger and reports whether it matches |
 | Input hardening | `page` capped (no integer-overflow 500s), 64 KB body limit, unknown fields rejected |
 

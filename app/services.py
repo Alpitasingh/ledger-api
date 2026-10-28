@@ -6,7 +6,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from .errors import AccountNotFound, DuplicateTransaction, IdempotencyMismatch, InsufficientBalance
+from .errors import AccountNotFound, DuplicateTransaction, InsufficientBalance
+from .validators import RESERVED_REF_PREFIX as LEG_PREFIX
 
 
 def _now():
@@ -136,15 +137,12 @@ def create_transaction(conn, account_id, tx_type, amount, description, reference
         _get_account(conn, account_id)
         existing = _find_tx(conn, account_id, reference_id)
         if existing is not None:
+            # Same reference_id on the same account is always a duplicate: nothing is created and the
+            # balance is untouched. `payload_matches` tells the client whether it was a faithful retry.
             same = (existing["type"], existing["amount"], existing["description"]) == (tx_type, amount, description)
-            if not same:
-                raise IdempotencyMismatch(
-                    "This reference_id was already used for a different transaction on this account.",
-                    extra={"existing_transaction": tx_to_dict(existing)},
-                )
             raise DuplicateTransaction(
                 "A transaction with this reference_id already exists for this account.",
-                extra={"existing_transaction": tx_to_dict(existing)},
+                extra={"existing_transaction": tx_to_dict(existing), "payload_matches": same},
             )
         try:
             tx = _apply(conn, account_id, tx_type, amount, description, reference_id)
@@ -188,24 +186,21 @@ def create_transfer(conn, from_id, to_id, amount, description, reference_id):
         ).fetchone()
         if dup is not None:
             same = (dup["to_account_id"], dup["amount"], dup["description"]) == (to_id, amount, desc)
-            if not same:
-                raise IdempotencyMismatch(
-                    "This reference_id was already used for a different transfer from this account.",
-                    extra={"existing_transfer": transfer_to_dict(dup)},
-                )
             raise DuplicateTransaction(
                 "A transfer with this reference_id already exists for the source account.",
-                extra={"existing_transfer": transfer_to_dict(dup)},
+                extra={"existing_transfer": transfer_to_dict(dup), "payload_matches": same},
             )
+        transfer_id = str(uuid.uuid4())
         try:
             # Both legs + both balance updates + the transfer record commit together or not at all.
-            # Leg references are derived so a transfer never collides with an ordinary
-            # transaction that happens to use the same reference_id on either account.
-            debit = _apply(conn, from_id, "debit", amount, f"{desc} (to {to_id})", f"{reference_id}:debit")
-            credit = _apply(conn, to_id, "credit", amount, f"{desc} (from {from_id})", f"{reference_id}:credit")
+            # Leg references are built from the (unique) transfer id under the reserved "xfer:" prefix
+            # (rejected for client-supplied references), so a leg can never collide with an ordinary
+            # transaction or with a leg of another transfer, whatever reference_id the client chose.
+            debit = _apply(conn, from_id, "debit", amount, f"{desc} (to {to_id})", f"{LEG_PREFIX}{transfer_id}:debit")
+            credit = _apply(conn, to_id, "credit", amount, f"{desc} (from {from_id})", f"{LEG_PREFIX}{transfer_id}:credit")
         except sqlite3.IntegrityError:
-            raise DuplicateTransaction("A ledger entry for this transfer reference already exists.") from None
-        transfer_id = str(uuid.uuid4())
+            # Unreachable by construction; kept as a last-resort guard (the whole block still rolls back).
+            raise DuplicateTransaction("A ledger entry for this transfer already exists.") from None
         conn.execute(
             "INSERT INTO transfers (id, from_account_id, to_account_id, amount, description, reference_id, "
             "debit_tx_id, credit_tx_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

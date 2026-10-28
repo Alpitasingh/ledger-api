@@ -8,6 +8,7 @@ MAX_AMOUNT_MINOR = 10**14  # 1 trillion major units
 MAX_LIMIT = 100
 MAX_PAGE = 1_000_000  # keeps OFFSET well inside SQLite's 64-bit integer range
 DEFAULT_LIMIT = 10
+RESERVED_REF_PREFIX = "xfer:"  # used internally for the ledger legs of a transfer
 
 
 def require_json_object(payload):
@@ -135,6 +136,8 @@ def validate_create_transaction(body, path_account_id=None, require_account_id=F
         errors.append(_err("type", "must be either 'credit' or 'debit'"))
     amount = _check_amount(body.get("amount"), errors)
     reference_id = _check_str(body.get("reference_id"), "reference_id", errors)
+    if reference_id and reference_id.startswith(RESERVED_REF_PREFIX):
+        errors.append(_err("reference_id", f"must not start with the reserved prefix '{RESERVED_REF_PREFIX}'"))
     description = _check_str(body.get("description"), "description", errors, required=False, max_len=255)
     if errors:
         raise ValidationError("Invalid transaction data.", errors) from None
